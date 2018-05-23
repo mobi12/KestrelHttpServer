@@ -8,7 +8,6 @@ using System.IO;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
@@ -30,6 +29,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
 
         private readonly object _shutdownLock = new object();
         private volatile bool _aborted;
+        private volatile ConnectionAbortedException _abortReason;
         private long _totalBytesWritten;
 
         internal SocketConnection(Socket socket, MemoryPool<byte> memoryPool, PipeScheduler scheduler, ISocketsTrace trace)
@@ -85,8 +85,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             }
         }
 
-        public override void Abort()
+        public override void AbortImpl(ConnectionAbortedException abortReason)
         {
+            _abortReason = abortReason;
+            Output.CancelPendingRead();
+
             // Try to gracefully close the socket to match libuv behavior.
             Shutdown();
         }
@@ -119,7 +122,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
                 if (!_aborted)
                 {
                     // Calling Dispose after ReceiveAsync can cause an "InvalidArgument" error on *nix.
-                    error = new ConnectionAbortedException();
                     _trace.ConnectionError(ConnectionId, error);
                 }
             }
@@ -127,7 +129,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             {
                 if (!_aborted)
                 {
-                    error = new ConnectionAbortedException();
                     _trace.ConnectionError(ConnectionId, error);
                 }
             }
@@ -145,7 +146,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             {
                 if (_aborted)
                 {
-                    error = error ?? new ConnectionAbortedException();
+                    error = error ?? _abortReason ?? new ConnectionAbortedException();
                 }
 
                 Input.Complete(error);
@@ -215,10 +216,12 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
             catch (IOException ex)
             {
                 error = ex;
+                _trace.ConnectionError(ConnectionId, error);
             }
             catch (Exception ex)
             {
                 error = new IOException(ex.Message, ex);
+                _trace.ConnectionError(ConnectionId, error);
             }
             finally
             {
@@ -233,8 +236,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal
         {
             while (true)
             {
-                // Wait for data to write from the pipe producer
                 var result = await Output.ReadAsync();
+
                 var buffer = result.Buffer;
 
                 if (result.IsCanceled)
