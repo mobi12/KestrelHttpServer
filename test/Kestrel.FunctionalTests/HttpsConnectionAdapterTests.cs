@@ -12,6 +12,7 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
@@ -375,7 +376,44 @@ namespace Microsoft.AspNetCore.Server.Kestrel.FunctionalTests
                 }
             }
         }
+#if NETCOREAPP2_2
+        [Fact]
+        public async Task CertificatePassedToHttpContextWhenHttp1and2Enabled()
+        {
+            var listenOptions = new ListenOptions(new IPEndPoint(IPAddress.Loopback, 0))
+            {
+                Protocols = HttpProtocols.Http1AndHttp2,
+                ConnectionAdapters =
+                {
+                    new HttpsConnectionAdapter(new HttpsConnectionAdapterOptions
+                    {
+                        ServerCertificate = _x509Certificate2,
+                        ClientCertificateMode = ClientCertificateMode.RequireCertificate,
+                        ClientCertificateValidation = (certificate, chain, sslPolicyErrors) => true
+                    })
+                }
+            };
 
+            using (var server = new TestServer(context =>
+            {
+                var tlsFeature = context.Features.Get<ITlsConnectionFeature>();
+                Assert.NotNull(tlsFeature);
+                Assert.NotNull(tlsFeature.ClientCertificate);
+                Assert.NotNull(context.Connection.ClientCertificate);
+                return context.Response.WriteAsync("hello world");
+            }, new TestServiceContext(LoggerFactory), listenOptions))
+            {
+                using (var client = new TcpClient())
+                {
+                    // SslStream is used to ensure the certificate is actually passed to the server
+                    // HttpClient might not send the certificate because it is invalid or it doesn't match any
+                    // of the certificate authorities sent by the server in the SSL handshake.
+                    var stream = await OpenSslStream(client, server, HttpProtocols.Http1);
+                    await AssertConnectionResult(stream, true);
+                }
+            }
+        }
+#endif
         [Fact]
         public async Task HttpsSchemePassedToRequestFeature()
         {
@@ -637,6 +675,35 @@ namespace Microsoft.AspNetCore.Server.Kestrel.FunctionalTests
             return stream;
         }
 
+#if NETCOREAPP2_2
+        private static async Task<SslStream> OpenSslStream(TcpClient client, TestServer server, HttpProtocols httpProtocols, X509Certificate2 clientCertificate = null)
+        {
+            await client.ConnectAsync("127.0.0.1", server.Port);
+            var options = new SslClientAuthenticationOptions()
+            {
+                TargetHost = "localhost",
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls11,
+                RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true,
+                LocalCertificateSelectionCallback = (sender, host, certificates, certificate, issuers) => clientCertificate ?? _x509Certificate2,
+            };
+
+            // Order sensitive
+            options.ApplicationProtocols = new List<SslApplicationProtocol>();
+            if ((httpProtocols & HttpProtocols.Http2) == HttpProtocols.Http1AndHttp2)
+            {
+                options.ApplicationProtocols.Add(SslApplicationProtocol.Http2);
+            }
+            if ((httpProtocols & HttpProtocols.Http1) == HttpProtocols.Http1)
+            {
+                options.ApplicationProtocols.Add(SslApplicationProtocol.Http11);
+            }
+            var stream = new SslStream(client.GetStream(), false);
+            await stream.AuthenticateAsClientAsync(options, CancellationToken.None);
+
+            return stream;
+        }
+#endif
         private static async Task AssertConnectionResult(SslStream stream, bool success)
         {
             var request = Encoding.UTF8.GetBytes("GET / HTTP/1.0\r\n\r\n");
